@@ -24,6 +24,20 @@ type mockResolver struct {
 	calls int
 }
 
+type reentrantResolver struct {
+	bypass *localBypass
+	calls  int
+}
+
+func (r *reentrantResolver) Resolve(ctx context.Context, _, _ string, _ ...resolver.Option) ([]net.IP, error) {
+	r.calls++
+	// Resolving a hostname-based nameserver may dial through the same bypass.
+	// The nested check must retain the original-address decision without
+	// recursively invoking this resolver.
+	r.bypass.Contains(ctx, "udp", "nameserver.example:53")
+	return []net.IP{net.ParseIP("8.8.8.8")}, nil
+}
+
 func (r *mockResolver) Resolve(context.Context, string, string, ...resolver.Option) ([]net.IP, error) {
 	r.calls++
 	return r.ips, r.err
@@ -292,6 +306,33 @@ func TestContains_ResolverFailureKeepsOriginalResult(t *testing.T) {
 	defer b.Close()
 
 	assert.False(t, b.Contains(context.Background(), "tcp", "dns.google:443"))
+}
+
+func TestContains_ResolverReentrySkipsDNSExpansion(t *testing.T) {
+	r := &reentrantResolver{}
+	b := newSyncedBypass(
+		MatchersOption([]string{"8.8.8.8"}),
+		ResolverOption(r),
+	)
+	r.bypass = b
+	defer b.Close()
+
+	assert.True(t, b.Contains(context.Background(), "tcp", "dns.google:443"))
+	assert.Equal(t, 1, r.calls)
+}
+
+func TestContains_ResolverContextDoesNotSuppressAnotherBypass(t *testing.T) {
+	r := &mockResolver{ips: []net.IP{net.ParseIP("8.8.8.8")}}
+	b := newSyncedBypass(
+		MatchersOption([]string{"8.8.8.8"}),
+		ResolverOption(r),
+	)
+	defer b.Close()
+
+	other := &localBypass{}
+	ctx := context.WithValue(context.Background(), resolvingContextKey{}, &resolvingContext{bypass: other})
+	assert.True(t, b.Contains(ctx, "tcp", "dns.google:443"))
+	assert.Equal(t, 1, r.calls)
 }
 
 func TestContains_DoesNotResolveUnneededAddresses(t *testing.T) {

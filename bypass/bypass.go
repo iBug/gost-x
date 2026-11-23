@@ -159,6 +159,23 @@ func LoggerOption(logger logger.Logger) Option {
 // bypassDecision represents the outcome of evaluating a bypass rule.
 type bypassDecision int
 
+// resolvingContextKey stores the bypasses currently performing DNS lookups.
+type resolvingContextKey struct{}
+
+type resolvingContext struct {
+	bypass *localBypass
+	parent *resolvingContext
+}
+
+func (rc *resolvingContext) contains(bypass *localBypass) bool {
+	for ; rc != nil; rc = rc.parent {
+		if rc.bypass == bypass {
+			return true
+		}
+	}
+	return false
+}
+
 const (
 	// decisionBypass means the address should connect directly, skipping the proxy chain.
 	decisionBypass bypassDecision = iota
@@ -463,17 +480,22 @@ func (p *localBypass) decideResolved(ctx context.Context, network, addr string) 
 	p.mu.RLock()
 	patterns := p.patterns
 	p.mu.RUnlock()
+	resolving, _ := ctx.Value(resolvingContextKey{}).(*resolvingContext)
 
 	matched := p.options.network == "" || p.options.network == network
 	if matched && patterns != nil {
 		matched = patterns.matchAny(addr)
-		if !matched && p.options.resolver != nil {
+		if !matched && p.options.resolver != nil && !resolving.contains(p) {
 			host, port, err := net.SplitHostPort(addr)
 			if err != nil {
 				host, port = addr, ""
 			}
 			if net.ParseIP(host) == nil {
-				ips, err := p.options.resolver.Resolve(ctx, "ip", host)
+				resolveCtx := context.WithValue(ctx, resolvingContextKey{}, &resolvingContext{
+					bypass: p,
+					parent: resolving,
+				})
+				ips, err := p.options.resolver.Resolve(resolveCtx, "ip", host)
 				if err != nil {
 					p.logger.Debugf("resolve %s: %v", host, err)
 				} else {
